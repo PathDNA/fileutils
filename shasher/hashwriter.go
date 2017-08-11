@@ -6,6 +6,12 @@ import (
 	"io"
 )
 
+const (
+	SignatureSize      = sha256.Size
+	versionAndHashSize = 1 + SignatureSize
+	version            = 1
+)
+
 func New(w io.Writer) *HashWriter {
 	return &HashWriter{
 		w: w,
@@ -14,13 +20,18 @@ func New(w io.Writer) *HashWriter {
 }
 
 func NewWithToken(w io.Writer, token []byte) (*HashWriter, error) {
-	hw := &HashWriter{
-		w: w,
-		h: sha256.New(),
-	}
-	if _, err := hw.Write(token); err != nil {
+	var (
+		hw = &HashWriter{
+			w: w,
+			h: sha256.New(),
+		}
+		versionAndHash = hashAndVersion(version, token)
+	)
+
+	if _, err := hw.Write(versionAndHash); err != nil {
 		return nil, err
 	}
+
 	return hw, nil
 }
 
@@ -41,14 +52,25 @@ func (hw *HashWriter) HashOnly(p []byte) (int, error) {
 	return hw.h.Write(p)
 }
 
-func (hw *HashWriter) Sign() (sig [32]byte, err error) {
+func (hw *HashWriter) Sign() (sig [SignatureSize]byte, err error) {
 	var n int
 	hw.h.Sum(sig[:0])
 	if n, err = hw.w.Write(sig[:]); err != nil {
 		return
 	}
 	hw.len += int64(n)
-	return sig, err
+	return
 }
 
 func (hw *HashWriter) Size() int64 { return hw.len }
+
+func hashAndVersion(version uint8, b []byte) []byte {
+	var (
+		h   = sha256.New()
+		sum [versionAndHashSize]byte
+	)
+	sum[0] = version
+	h.Write(b)
+	h.Sum(sum[1:1])
+	return sum[:]
+}

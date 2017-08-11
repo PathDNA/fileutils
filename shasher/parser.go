@@ -8,34 +8,42 @@ import (
 )
 
 // Parse is shorthand for ParseWithToken(nil, r, w).
-func Parse(r io.ReadSeeker, w io.Writer) (sig [sha256.Size]byte, bytesWritten int64, err error) {
+func Parse(r io.ReadSeeker, w io.Writer) (sig [SignatureSize]byte, bytesWritten int64, err error) {
 	return ParseWithToken(nil, r, w)
 }
 
 // ParseWithToken parses the r input and verifies it starts with the token then writes the data to w and verifies the signature.
 // returns the sha256 signature of the whole message, number of actual data bytes (excluding token and signature) or an err.
-func ParseWithToken(token []byte, r io.ReadSeeker, w io.Writer) (sig [sha256.Size]byte, bytesWritten int64, err error) {
+func ParseWithToken(token []byte, r io.ReadSeeker, w io.Writer) (sig [SignatureSize]byte, bytesWritten int64, err error) {
 	var (
-		otoken = make([]byte, len(token))
-		h      = sha256.New()
-		osig   [sha256.Size]byte
-		pos    int64
+		oVersionAndHash [versionAndHashSize]byte
+		sum             = hashAndVersion(version, token)
+		h               = sha256.New()
+		osig            [SignatureSize]byte
+		pos             int64
 	)
 
 	if len(token) > 0 {
-		if _, err = io.ReadFull(r, otoken); err != nil {
+		if _, err = io.ReadFull(r, oVersionAndHash[:]); err != nil {
 			return
 		}
 
-		if !bytes.Equal(token, otoken) {
-			err = fmt.Errorf("token mismatch: %s != %s", token, otoken)
+		if !bytes.Equal(oVersionAndHash[1:], sum[1:]) {
+			err = fmt.Errorf("token mismatch: %x != %x", oVersionAndHash[1:], sum)
 			return
 		}
 
-		h.Write(token)
+		switch oVersionAndHash[0] {
+		case version:
+		default:
+			err = fmt.Errorf("unexpected version: 0x%X", oVersionAndHash[0])
+			return
+		}
+
+		h.Write(oVersionAndHash[:])
 	}
 
-	if pos, err = r.Seek(int64(-sha256.Size), io.SeekEnd); err != nil {
+	if pos, err = r.Seek(int64(-SignatureSize), io.SeekEnd); err != nil {
 		return
 	}
 
@@ -44,11 +52,11 @@ func ParseWithToken(token []byte, r io.ReadSeeker, w io.Writer) (sig [sha256.Siz
 		return
 	}
 
-	if _, err = r.Seek(int64(len(token)), io.SeekStart); err != nil {
+	if _, err = r.Seek(int64(versionAndHashSize), io.SeekStart); err != nil {
 		return
 	}
 
-	bytesWritten, err = io.Copy(io.MultiWriter(h, w), io.LimitReader(r, pos-int64(len(token))))
+	bytesWritten, err = io.Copy(io.MultiWriter(h, w), io.LimitReader(r, pos-int64(versionAndHashSize)))
 	if !bytes.Equal(h.Sum(osig[:0]), sig[:]) {
 		err = fmt.Errorf("signature mismatch: %x != %x", osig[:], sig[:])
 	}
