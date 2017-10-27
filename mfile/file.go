@@ -1,9 +1,21 @@
 package mfile
 
+// TODO:
+// * explore file locking
+// * use mmap, but that would make appending/trunc a lot harder.
+
 import (
 	"io"
 	"os"
 	"sync"
+)
+
+var (
+	_ io.ReaderFrom = (*File)(nil)
+	_ io.ReaderAt   = (*File)(nil)
+	_ io.WriterTo   = (*File)(nil)
+	_ io.WriterAt   = (*File)(nil)
+	_ io.Closer     = (*File)(nil)
 )
 
 // New opens fp with os.O_CREATE|os.O_RDWR and the given permissions.
@@ -21,50 +33,61 @@ func New(fp string, perm os.FileMode) (*File, error) {
 	}
 
 	return &File{
-		f:      f,
-		closed: make(chan struct{}),
-		size:   sz,
+		f:    f,
+		size: sz,
 	}, nil
 }
 
-// File is an *os.File wrapper that allows multiple readers or a single writer.
+// File is an `*os.File` wrapper that allows multiple readers or one writer on a single file descriptor.
 type File struct {
 	f   *os.File
 	mux sync.RWMutex
 
-	closed chan struct{}
-	size   int64
-	locked bool
+	size int64
+
+	SyncAfterWriterClose bool // if set to true, calling `Writer.Close()`, will call `*os.File.Sync()`.
 }
 
-func (f *File) Reader() *Reader { return f.ReaderAt(0) }
-
-func (f *File) ReaderAt(off int64) *Reader {
-	f.mux.RLock()
-	return &Reader{
-		f:   f,
-		off: off,
-	}
+// ReadFrom implements `io.ReaderFrom`.
+func (f *File) ReadFrom(rd io.Reader) (n int64, err error) {
+	wr := f.WriterAt(0)
+	n, err = io.Copy(wr, rd)
+	wr.Close()
+	return
 }
 
-func (f *File) Writer(append bool) *Writer {
-	if append {
-		return f.WriterAt(f.size)
-	}
-	return f.WriterAt(0)
+// WriteTo implements `io.WriterTo`.
+func (f *File) WriteTo(w io.Writer) (n int64, err error) {
+	r := f.ReaderAt(0)
+	n, err = io.Copy(w, r)
+	r.Close()
+	return
 }
 
-func (f *File) WriterAt(off int64) *Writer {
-	f.mux.Lock()
-
-	f.f.Seek(off, io.SeekStart)
-
-	return &Writer{
-		f:   f,
-		off: off,
-	}
+// ReadAt implements `io.ReaderAt`.
+func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
+	r := f.ReaderAt(off)
+	n, err = r.Read(b)
+	return
 }
 
+// WriteAt implements `io.WriterAt`.
+func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
+	wr := f.WriterAt(off)
+	n, err = wr.Write(b)
+	wr.Close()
+	return
+}
+
+// Append wraps `f.Writer(true)` for convience.
+func (f *File) Append(b []byte) (n int, err error) {
+	w := f.Writer(true)
+	n, err = w.Write(b)
+	w.Close()
+	return
+}
+
+// Truncate truncates the underlying `*os.File` to the specific size.
 func (f *File) Truncate(sz int64) (err error) {
 	f.mux.Lock()
 	if err = f.f.Truncate(sz); err == nil {
@@ -74,6 +97,8 @@ func (f *File) Truncate(sz int64) (err error) {
 	return
 }
 
+// Size returns the current file size.
+// the size is cached after each writer is closed, so it doesn't call Stat().
 func (f *File) Size() int64 {
 	f.mux.RLock()
 	sz := f.size
@@ -81,6 +106,15 @@ func (f *File) Size() int64 {
 	return sz
 }
 
+// Stat calls the underlying `*os.File.Stat()`.
+func (f *File) Stat() (fi os.FileInfo, err error) {
+	f.mux.RLock()
+	fi, err = f.f.Stat()
+	f.mux.RUnlock()
+	return
+}
+
+// With acquires a write lock and calls fn with the underlying `*os.File` and returns any errors it returns.
 func (f *File) With(fn func(*os.File) error) error {
 	f.mux.Lock()
 	defer f.mux.Unlock()
@@ -89,27 +123,25 @@ func (f *File) With(fn func(*os.File) error) error {
 
 func (f *File) closeWriter() (err error) {
 	defer f.mux.Unlock()
-	if err = f.f.Sync(); err != nil {
-		return
+
+	if f.SyncAfterWriterClose {
+		if err = f.f.Sync(); err != nil {
+			return
+		}
 	}
 
 	f.size, err = getSize(f.f)
 	return
 }
 
+// ForceClose will close the underlying `*os.File` without waiting for any active readers/writer.
 func (f *File) ForceClose() error {
-	if f.locked {
-		f.unlock()
-	}
 	return f.f.Close()
 }
 
-// Close signals all the underlying readers and writers and waits for them to finish then closes the actual file.
+// Close waits for all the active readers/writer to finish before closing the underlying `*os.File`.
 func (f *File) Close() error {
 	f.mux.Lock()
-	if f.locked {
-		f.unlock()
-	}
 	err := f.f.Close()
 	f.mux.Unlock()
 
@@ -121,6 +153,10 @@ func getSize(f *os.File) (int64, error) {
 
 	if err != nil {
 		return 0, err
+	}
+
+	if !st.Mode().IsRegular() {
+		return 0, os.ErrInvalid
 	}
 
 	return st.Size(), nil
