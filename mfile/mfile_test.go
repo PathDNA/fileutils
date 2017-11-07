@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io/ioutil"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -94,4 +95,12 @@ func Test(t *testing.T) {
 	}
 
 	mf.Close() // make sure there are no deadlocks
+
+	if _, err = mf.Read([]byte{0}); err == nil || !strings.Contains(err.Error(), "already closed") {
+		t.Errorf("unexpected error: %#+v", err)
+	}
+
+	if _, err = mf.Write([]byte{0}); err == nil || !strings.Contains(err.Error(), "already closed") {
+		t.Errorf("unexpected error: %#+v", err)
+	}
 }
