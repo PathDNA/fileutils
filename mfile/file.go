@@ -12,8 +12,10 @@ import (
 )
 
 var (
+	_ io.Reader     = (*File)(nil)
 	_ io.ReaderFrom = (*File)(nil)
 	_ io.ReaderAt   = (*File)(nil)
+	_ io.Writer     = (*File)(nil)
 	_ io.WriterTo   = (*File)(nil)
 	_ io.WriterAt   = (*File)(nil)
 	_ io.Closer     = (*File)(nil)
@@ -64,11 +66,20 @@ type File struct {
 	SyncAfterWriterClose bool // if set to true, calling `Writer.Close()`, will call `*os.File.Sync()`.
 }
 
-// ReadFrom implements `io.ReaderFrom`.
-func (f *File) ReadFrom(rd io.Reader) (n int64, err error) {
-	wr := f.WriterAt(0)
-	n, err = io.Copy(wr, rd)
-	wr.Close()
+// ReadAt implements `io.Read`.
+// Note that will always start at offset 0.
+func (f *File) Read(b []byte) (n int, err error) {
+	r := f.ReaderAt(0)
+	n, err = r.Read(b)
+	r.Close()
+	return
+}
+
+// ReadAt implements `io.ReaderAt`.
+func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
+	r := f.ReaderAt(off)
+	n, err = r.Read(b)
+	r.Close()
 	return
 }
 
@@ -80,10 +91,12 @@ func (f *File) WriteTo(w io.Writer) (n int64, err error) {
 	return
 }
 
-// ReadAt implements `io.ReaderAt`.
-func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
-	r := f.ReaderAt(off)
-	n, err = r.Read(b)
+// ReadFrom implements `io.ReaderFrom`.
+// Appends to the end of the file.
+func (f *File) ReadFrom(rd io.Reader) (n int64, err error) {
+	wr := f.Appender()
+	n, err = io.Copy(wr, rd)
+	wr.Close()
 	return
 }
 
@@ -117,13 +130,11 @@ func (f *File) Truncate(sz int64) (err error) {
 // Size returns the current file size.
 // the size is cached after each writer is closed, so it doesn't call Stat().
 func (f *File) Size() int64 {
-	f.mux.RLock()
-	sz := f.size
-	f.mux.RUnlock()
-	return sz
+	return f.getSize()
 }
 
 // Stat calls the underlying `*os.File.Stat()`.
+// Will block if there are any active appenders or writers.
 func (f *File) Stat() (fi os.FileInfo, err error) {
 	f.mux.Lock()
 	fi, err = f.f.Stat()
