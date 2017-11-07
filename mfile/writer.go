@@ -5,27 +5,27 @@ import (
 	"os"
 )
 
-// TODO: should writer implement Reader as well?
-
 var (
 	_ io.Seeker      = (*Writer)(nil)
 	_ io.WriterAt    = (*Writer)(nil)
 	_ io.WriteCloser = (*Writer)(nil)
 )
 
-// Writer returns `append ? f.WriterAt(f.Size()) : f.WriterAt(0)`.
-func (f *File) Writer(append bool) *Writer {
-	if append {
-		return f.WriterAt(f.size)
-	}
-	return f.WriterAt(0)
+// Writer returns f.WriteAt(-1).
+func (f *File) Writer() *Writer {
+	return f.WriterAt(-1)
 }
 
 // WriterAt acquires a write-lock, seeks to the given offset and returns a writer.
+// if off is < 0, it seeks to the end of the file, otherwise it seeks to the off value.
 func (f *File) WriterAt(off int64) *Writer {
 	f.mux.Lock()
-
-	f.f.Seek(off, io.SeekStart)
+	f.wg.Add(1)
+	if off < 0 {
+		off, _ = f.f.Seek(0, io.SeekEnd)
+	} else {
+		f.f.Seek(off, io.SeekStart)
+	}
 
 	return &Writer{
 		f:   f,
@@ -54,7 +54,7 @@ func (w *Writer) WriteAt(b []byte, off int64) (n int, err error) {
 	if w.f == nil {
 		return 0, os.ErrClosed
 	}
-	return w.f.f.WriteAt(b, off)
+	return w.f.WriteAt(b, off)
 }
 
 // Seek implements `io.Seeker`.
@@ -68,12 +68,28 @@ func (w *Writer) Seek(offset int64, whence int) (n int64, err error) {
 }
 
 // Close releases the parent's write-lock.
-func (w *Writer) Close() error {
+func (w *Writer) Close() (err error) {
 	if w.f == nil {
 		return os.ErrClosed
 	}
 
-	err := w.f.closeWriter()
-	w.f = nil
-	return err
+	defer func() {
+		w.f.wg.Done()
+		w.f.mux.Unlock()
+		w.f = nil
+	}()
+
+	if w.f.SyncAfterWriterClose {
+		if err = w.f.f.Sync(); err != nil {
+			return
+		}
+	}
+
+	var sz int64
+	if sz, err = getSize(w.f.f); err != nil {
+		return
+	}
+
+	w.f.setSize(sz)
+	return
 }

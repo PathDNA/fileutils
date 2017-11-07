@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -18,7 +19,7 @@ var (
 	_ io.Closer     = (*File)(nil)
 )
 
-// New opens fp with os.O_CREATE|os.O_RDWR and the given permissions.
+// New opens `fp`` with `os.O_CREATE|os.O_RDWR`` and the given permissions.
 func New(fp string, perm os.FileMode) (*File, error) {
 	f, err := os.OpenFile(fp, os.O_CREATE|os.O_RDWR, perm)
 
@@ -26,6 +27,17 @@ func New(fp string, perm os.FileMode) (*File, error) {
 		return nil, err
 	}
 
+	mf, err := FromFile(f)
+	if err != nil {
+		f.Close()
+	}
+
+	return mf, err
+}
+
+// FromFile returns a `*File` from an `*os.File`.
+// Using `f.Writer` requires that the file to *not* be opened with os.O_APPEND.
+func FromFile(f *os.File) (*File, error) {
 	sz, err := getSize(f)
 
 	if err != nil {
@@ -38,10 +50,14 @@ func New(fp string, perm os.FileMode) (*File, error) {
 	}, nil
 }
 
-// File is an `*os.File` wrapper that allows multiple readers or one writer on a single file descriptor.
+// File is an `*os.File` wrapper that allows multiple readers or one writer or appender on a single file descriptor.
 type File struct {
-	f   *os.File
-	mux sync.RWMutex
+	f *os.File
+
+	mux  sync.RWMutex
+	amux sync.Mutex
+
+	wg sync.WaitGroup
 
 	size int64
 
@@ -79,11 +95,12 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 	return
 }
 
-// Append wraps `f.Writer(true)` for convience.
-func (f *File) Append(b []byte) (n int, err error) {
-	w := f.Writer(true)
-	n, err = w.Write(b)
-	w.Close()
+// Write wraps `f.Appender().Write` for convenience.
+// If expecting multiple `Write` calls, use `f.Appender()`` directly.
+func (f *File) Write(b []byte) (n int, err error) {
+	a := f.Appender()
+	n, err = a.Write(b)
+	a.Close()
 	return
 }
 
@@ -91,7 +108,7 @@ func (f *File) Append(b []byte) (n int, err error) {
 func (f *File) Truncate(sz int64) (err error) {
 	f.mux.Lock()
 	if err = f.f.Truncate(sz); err == nil {
-		f.size = sz
+		f.setSize(sz)
 	}
 	f.mux.Unlock()
 	return
@@ -108,9 +125,9 @@ func (f *File) Size() int64 {
 
 // Stat calls the underlying `*os.File.Stat()`.
 func (f *File) Stat() (fi os.FileInfo, err error) {
-	f.mux.RLock()
+	f.mux.Lock()
 	fi, err = f.f.Stat()
-	f.mux.RUnlock()
+	f.mux.Unlock()
 	return
 }
 
@@ -121,19 +138,6 @@ func (f *File) With(fn func(*os.File) error) error {
 	return fn(f.f)
 }
 
-func (f *File) closeWriter() (err error) {
-	defer f.mux.Unlock()
-
-	if f.SyncAfterWriterClose {
-		if err = f.f.Sync(); err != nil {
-			return
-		}
-	}
-
-	f.size, err = getSize(f.f)
-	return
-}
-
 // ForceClose will close the underlying `*os.File` without waiting for any active readers/writer.
 func (f *File) ForceClose() error {
 	return f.f.Close()
@@ -141,12 +145,18 @@ func (f *File) ForceClose() error {
 
 // Close waits for all the active readers/writer to finish before closing the underlying `*os.File`.
 func (f *File) Close() error {
+	f.wg.Wait()
+
 	f.mux.Lock()
 	err := f.f.Close()
 	f.mux.Unlock()
 
 	return err
 }
+
+func (f *File) getSize() int64            { return atomic.LoadInt64(&f.size) }
+func (f *File) setSize(sz int64)          { atomic.StoreInt64(&f.size, sz) }
+func (f *File) addSize(delta int64) int64 { return atomic.AddInt64(&f.size, delta) }
 
 func getSize(f *os.File) (int64, error) {
 	st, err := f.Stat()
