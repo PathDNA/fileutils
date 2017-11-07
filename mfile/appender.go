@@ -11,11 +11,12 @@ func (f *File) Appender() io.WriteCloser {
 	f.amux.Lock()
 	f.wg.Add(1)
 	f.f.Seek(0, io.SeekEnd)
-	return &appender{f}
+	return &appender{f: f}
 }
 
 type appender struct {
-	f *File
+	f  *File
+	sz int64
 }
 
 func (a *appender) Write(b []byte) (n int, err error) {
@@ -23,7 +24,7 @@ func (a *appender) Write(b []byte) (n int, err error) {
 		return 0, os.ErrClosed
 	}
 	n, err = a.f.f.Write(b)
-	a.f.addSize(int64(n))
+	a.sz += int64(n)
 	return
 }
 
@@ -37,6 +38,7 @@ func (a *appender) Close() (err error) {
 	}
 
 	a.f.wg.Done()
+	a.f.addSize(a.sz)
 	a.f.amux.Unlock()
 	a.f.mux.RUnlock()
 	a.f = nil
